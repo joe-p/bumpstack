@@ -42,11 +42,16 @@ When several tags match, `--order` decides the winner:
 
 | Mode | Behaviour |
 | --- | --- |
-| `pushed` (default) | Newest pushed tag. Falls back to newest version when the registry cannot report push times. |
-| `version` | Newest version by natural ordering, regardless of when it was pushed. |
+| `version` (default) | Newest version by natural ordering, regardless of when it was pushed. |
+| `pushed` | Newest pushed tag. Falls back to newest version when the registry cannot report push times. |
 
 Natural ordering compares runs of digits numerically, so `v3.10` sorts after
 `v3.9` and build counters like `1.2.3-r4` behave as expected.
+
+`version` is the default because it is both the predictable choice and the
+cheap one: on a registry that does not expose push times, `pushed` has to read
+each matching tag's image config before it can rank them (see
+[Registries](#registries)).
 
 ### Digest pinning
 
@@ -66,7 +71,11 @@ that as a failure instead.
   timestamp per tag and is ordered by most recently updated.
 * **Every other registry** uses the OCI `/v2/<name>/tags/list` endpoint with the
   standard bearer-token handshake. Push times are not part of the protocol, so
-  the image config `created` timestamp is used as a best-effort proxy.
+  the image config `created` timestamp is used as a best-effort proxy. Reading
+  it costs a couple of requests per matching tag, so it only happens under
+  `--order pushed`, only when at most 100 tags match, and with a few tags
+  probed in parallel. Under the default `--order version` no probing is needed
+  at all.
 
 ## Install
 
@@ -93,9 +102,9 @@ bumpstack [OPTIONS] [FILE]      FILE defaults to docker-compose.yml
 | `-w`, `--write` | Apply the changes to the file. Without it `bumpstack` only reports what it would change (dry run). |
 | `--check` | Write nothing; exit 1 if any image needs updating. Useful in CI. |
 | `-s`, `--service NAME` | Only process this service; repeatable. |
-| `--order pushed\|version` | Pick the newest pushed tag (default) or the newest version. |
+| `--order version\|pushed` | Pick the newest version (default) or the newest pushed tag. |
 | `--require-multiarch` | Fail instead of pinning a single-architecture tag. |
-| `-j`, `--concurrency N` | Images to query in parallel (default 4). |
+| `-j`, `--concurrency N` | Registry requests to issue in parallel (default 4). |
 | `--insecure` | Use plain HTTP, for local test registries. |
 | `-v`, `--verbose` | Extra diagnostics, including skipped images. |
 | `-h`, `--help` | Print help. |
@@ -125,8 +134,8 @@ bumpstack --write docker-compose.yml
 # Fail CI when an image is behind
 bumpstack --check
 
-# Only the newest versions, only these services, more parallelism
-bumpstack --order version -s api -s worker -j 8 --write
+# Track the most recently pushed tags, only these services, more parallelism
+bumpstack --order pushed -s api -s worker -j 8 --write
 ```
 
 ## Credentials

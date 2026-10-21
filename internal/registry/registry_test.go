@@ -4,11 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/joe-p/bumpstack/internal/dockerconfig"
+	"github.com/joe-p/bumpstack/internal/reference"
 )
 
 func TestSessionRejectsCrossOriginURLs(t *testing.T) {
@@ -135,4 +139,132 @@ func parseManifest(t *testing.T, text string) manifest {
 		t.Fatal(err)
 	}
 	return m
+}
+
+// tagServer serves a tag list plus the manifests and config blobs needed to
+// probe push times. It counts the requests that probing costs.
+func tagServer(t *testing.T, tags ...string) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var probes atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/tags/list"):
+			body, err := json.Marshal(tagsPage{Tags: tags})
+			if err != nil {
+				t.Error(err)
+			}
+			w.Write(body)
+		case strings.Contains(r.URL.Path, "/manifests/"):
+			probes.Add(1)
+			w.Write([]byte(`{"config":{"digest":"sha256:cfg"}}`))
+		case strings.Contains(r.URL.Path, "/blobs/"):
+			probes.Add(1)
+			w.Write([]byte(`{"created":"2024-01-01T00:00:00Z"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, &probes
+}
+
+func TestVersionOrderingSkipsPushTimeProbing(t *testing.T) {
+	server, probes := tagServer(t, "1", "2", "3")
+	client := New(dockerconfig.Load(false), true)
+	ref := ociReference(t, server.URL)
+	pattern := regexp.MustCompile(`^\d+$`)
+
+	matches, err := client.FindMatchingTags(ref, pattern, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("matches = %d, want 3", len(matches))
+	}
+	if got := probes.Load(); got != 0 {
+		t.Errorf("version ordering made %d manifest/blob requests, want 0", got)
+	}
+	for _, match := range matches {
+		if match.Pushed != nil {
+			t.Errorf("%s has a push time under version ordering", match.Tag)
+		}
+	}
+}
+
+func TestPushedOrderingProbesPushTimes(t *testing.T) {
+	server, probes := tagServer(t, "1", "2", "3")
+	client := New(dockerconfig.Load(false), true)
+	ref := ociReference(t, server.URL)
+
+	matches, err := client.FindMatchingTags(ref, regexp.MustCompile(`^\d+$`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("matches = %d, want 3", len(matches))
+	}
+	if probes.Load() == 0 {
+		t.Error("pushed ordering did not probe any push times")
+	}
+	for _, match := range matches {
+		if match.Pushed == nil {
+			t.Errorf("%s has no push time under pushed ordering", match.Tag)
+		}
+	}
+}
+
+func TestBroadPatternsSkipProbing(t *testing.T) {
+	tags := make([]string, 0, maxProbeTags+1)
+	for i := 0; i <= maxProbeTags; i++ {
+		tags = append(tags, strconv.Itoa(i))
+	}
+	server, probes := tagServer(t, tags...)
+	client := New(dockerconfig.Load(false), true)
+	ref := ociReference(t, server.URL)
+
+	matches, err := client.FindMatchingTags(ref, regexp.MustCompile(`^\d+$`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != len(tags) {
+		t.Fatalf("matches = %d, want %d", len(matches), len(tags))
+	}
+	if probes.Load() != 0 {
+		t.Errorf("a pattern with %d matches still probed %d tags", len(matches), probes.Load())
+	}
+}
+
+func TestTagListingFollowsNextLink(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.RawQuery, "last=b") {
+			w.Write([]byte(`{"tags":["v2"]}`))
+			return
+		}
+		w.Header().Set("Link", `</v2/app/tags/list?last=b&n=1000>; rel="next"`)
+		w.Write([]byte(`{"tags":["v1"]}`))
+	}))
+	defer server.Close()
+
+	client := New(dockerconfig.Load(false), true)
+	ref := ociReference(t, server.URL)
+	matches, err := client.FindMatchingTags(ref, regexp.MustCompile(`^v\d+$`), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(matches))
+	for i, match := range matches {
+		got[i] = match.Tag
+	}
+	if want := []string{"v1", "v2"}; !slices.Equal(got, want) {
+		t.Errorf("tags = %v, want %v", got, want)
+	}
+}
+
+func ociReference(t *testing.T, serverURL string) reference.Reference {
+	t.Helper()
+	ref, err := reference.Parse(strings.TrimPrefix(serverURL, "http://") + "/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ref
 }

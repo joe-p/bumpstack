@@ -101,6 +101,16 @@ func TestWriteIsOptIn(t *testing.T) {
 	}
 }
 
+func TestOrderDefaultsToVersion(t *testing.T) {
+	opts, err := parseArgs([]string{"compose.yml"})
+	if err != nil || opts == nil {
+		t.Fatalf("parseArgs = %v, %v; want options, nil", opts, err)
+	}
+	if opts.order != updater.OrderVersion {
+		t.Errorf("default order = %v; want version", opts.order)
+	}
+}
+
 func TestParseWriteFlag(t *testing.T) {
 	for _, tc := range []struct {
 		args  []string

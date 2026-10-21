@@ -18,10 +18,12 @@ import (
 type OrderMode int
 
 const (
+	// OrderVersion picks the newest version by natural ordering, regardless of
+	// when it was pushed. It is the default: on registries without push times it
+	// is the only mode that needs no extra manifest requests per tag.
+	OrderVersion OrderMode = iota
 	// OrderPushed picks the newest pushed tag (falling back to newest version).
-	OrderPushed OrderMode = iota
-	// OrderVersion picks the newest version, regardless of when it was pushed.
-	OrderVersion
+	OrderPushed
 )
 
 func (o OrderMode) String() string {

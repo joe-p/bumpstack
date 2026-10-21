@@ -1,0 +1,21 @@
+services:
+  openwebui:
+    # version: ^0\.\d+\.\d+$
+    image: ghcr.io/open-webui/open-webui:0.11.4@sha256:9591b13f13843c7721c2b8eaf7382846c81b3ffe126526d1888d1fed50c6a33f
+    ports:
+      - "3005:8080"
+    volumes:
+      - ./volumes/open-webui:/app/backend/data
+    environment:
+      WEBUI_AUTH: False
+  litellm:
+    # version: ^v1\.\d+\.\d+$
+    image: litellm/litellm:v1.89.1
+    env_file:
+      - .env
+    ports:
+      - 4000:4000
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml # Mount the local configuration file
+    command: [ "--config", "/app/config.yaml", "--port", "4000" ]
+

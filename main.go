@@ -85,7 +85,7 @@ func parseArgs(args []string) (*options, error) {
 	fs.BoolVar(&opts.insecure, "insecure", false, "")
 	fs.IntVar(&opts.concurrency, "j", 4, "")
 	fs.IntVar(&opts.concurrency, "concurrency", 4, "")
-	orderRaw := fs.String("order", "pushed", "")
+	orderRaw := fs.String("order", "version", "")
 	fs.BoolVar(&opts.requireMultiarch, "require-multiarch", false, "")
 	fs.BoolVar(&opts.verbose, "v", false, "")
 	fs.BoolVar(&opts.verbose, "verbose", false, "")
@@ -174,6 +174,7 @@ func execute(opts *options) (int, error) {
 
 	registry.Version = version
 	client := registry.New(dockerconfig.Load(opts.verbose), opts.insecure)
+	client.SetConcurrency(opts.concurrency)
 	planOpts := updater.Options{
 		Services:         opts.services,
 		Concurrency:      opts.concurrency,
@@ -285,11 +286,11 @@ Options:
   -w, --write              Apply the changes to FILE (default is a dry run).
       --check              Write nothing; exit 1 if any image needs updating.
   -s, --service NAME       Only process this service; repeatable.
-      --order pushed|version
-                           Pick the newest pushed tag (default) or the newest
-                           version.
+      --order version|pushed
+                           Pick the newest version (default) or the newest
+                           pushed tag.
       --require-multiarch  Fail instead of pinning a single-architecture tag.
-  -j, --concurrency N      Images to query in parallel (default 4).
+  -j, --concurrency N      Registry requests to issue in parallel (default 4).
       --insecure           Use plain HTTP - for local test registries.
   -v, --verbose            Extra diagnostics, including skipped images.
   -h, --help               Print this help.

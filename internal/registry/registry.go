@@ -26,6 +26,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/joe-p/bumpstack/internal/dockerconfig"
@@ -64,10 +66,11 @@ func (r ResolvedDigest) IsMultiarch() bool { return len(r.Platforms) > 1 }
 
 // Client talks to registries.
 type Client struct {
-	http     *http.Client
-	creds    *dockerconfig.Store
-	insecure bool
-	maxTags  int
+	http        *http.Client
+	creds       *dockerconfig.Store
+	insecure    bool
+	maxTags     int
+	concurrency int
 }
 
 // New builds a registry client.
@@ -82,11 +85,20 @@ func New(creds *dockerconfig.Store, insecure bool) *Client {
 		ExpectContinueTimeout: time.Second,
 	}
 	return &Client{
-		http:     &http.Client{Transport: transport},
-		creds:    creds,
-		insecure: insecure,
-		maxTags:  20_000,
+		http:        &http.Client{Transport: transport},
+		creds:       creds,
+		insecure:    insecure,
+		maxTags:     100_000,
+		concurrency: 8,
 	}
+}
+
+// SetConcurrency bounds the number of registry requests issued in parallel.
+func (c *Client) SetConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	c.concurrency = n
 }
 
 func (c *Client) scheme() string {
@@ -107,16 +119,18 @@ func apiHost(image reference.Reference) string {
 // FindMatchingTags returns the tags matching pattern that the registry knows
 // about.
 //
-// When needAll is false and the registry can order tags by push time, finding
-// the first match is enough and paging stops early. Otherwise every match is
-// collected so the caller can pick by version.
+// needAll tells the client that every match is wanted rather than only the
+// newest push. On Docker Hub that allows paging to stop at the first match. An
+// OCI registry cannot order tags by push time, so it always collects every
+// match; there, needAll instead decides whether the per-tag push-time probing
+// can be skipped, since only the pushed ordering reads those timestamps.
 func (c *Client) FindMatchingTags(image reference.Reference, pattern *regexp.Regexp, needAll bool) ([]TagMatch, error) {
 	if image.Registry == "docker.io" {
 		if matches, err := c.dockerHubTags(image, pattern, needAll); err == nil && len(matches) > 0 {
 			return matches, nil
 		}
 	}
-	return c.ociTags(image, pattern)
+	return c.ociTags(image, pattern, !needAll)
 }
 
 // ResolveDigest resolves the manifest a tag currently points at, including
@@ -174,20 +188,22 @@ func (c *Client) dockerHubTags(image reference.Reference, pattern *regexp.Regexp
 		namespace, repository = ns, repo
 	}
 
+	const pageSize = 100
 	url := fmt.Sprintf(
-		"https://hub.docker.com/v2/repositories/%s/%s/tags?page_size=100&ordering=last_updated",
-		namespace, repository,
+		"https://hub.docker.com/v2/repositories/%s/%s/tags?page_size=%d&ordering=last_updated",
+		namespace, repository, pageSize,
 	)
-	var matches []TagMatch
-	scanned, pages := 0, 0
 
-	for {
-		var page hubTagsPage
-		if err := c.getJSON(url, &page); err != nil {
+	var matches []TagMatch
+	scanned := 0
+
+	for page := 0; ; page++ {
+		var payload hubTagsPage
+		if err := c.getJSON(url, &payload); err != nil {
 			return nil, fmt.Errorf("querying Docker Hub for %s/%s: %w", namespace, repository, err)
 		}
 
-		for _, entry := range page.Results {
+		for _, entry := range payload.Results {
 			scanned++
 			if !pattern.MatchString(entry.Name) {
 				continue
@@ -204,49 +220,60 @@ func (c *Client) dockerHubTags(image reference.Reference, pattern *regexp.Regexp
 			}
 		}
 
-		if page.Next == "" {
+		if payload.Next == "" || len(payload.Results) == 0 || scanned >= c.maxTags || page+1 >= maxTagPages {
 			return matches, nil
 		}
-		url = page.Next
-		pages++
-		if pages >= 200 || scanned >= c.maxTags {
-			return matches, nil
-		}
+		url = payload.Next
 	}
 }
 
 // -- OCI distribution -------------------------------------------------------
 
-func (c *Client) ociTags(image reference.Reference, pattern *regexp.Regexp) ([]TagMatch, error) {
+// tagPageSize is the page size requested from the tags/list endpoint. Some
+// registries cap it server-side, so paging always follows the `rel="next"`
+// Link header rather than assuming a page held tagPageSize tags.
+const tagPageSize = 1000
+
+// maxTagPages bounds how many tag-list pages are fetched, a guard against a
+// registry that never stops paging. It is generous enough to reach maxTags even
+// when a registry serves far fewer tags per page than requested.
+const maxTagPages = 1000
+
+// maxProbeTags caps how many tags are probed for a push timestamp. Probing
+// costs a couple of requests per tag, so a broad pattern falls back to natural
+// ordering instead.
+const maxProbeTags = 100
+
+// ociTags lists every tag an OCI registry advertises and keeps the ones
+// matching pattern.
+//
+// Push times are not part of the protocol, so they have to be read from each
+// tag's image config. That only happens when the caller actually needs them
+// (needPushTimes); version ordering ignores them and skips the extra requests.
+func (c *Client) ociTags(image reference.Reference, pattern *regexp.Regexp, needPushTimes bool) ([]TagMatch, error) {
 	session := newSession(c, apiHost(image), image.Repository)
 
-	path := fmt.Sprintf("/v2/%s/tags/list?n=1000", image.Repository)
+	path := fmt.Sprintf("/v2/%s/tags/list?n=%d", image.Repository, tagPageSize)
 	var tags []string
-	pages := 0
 
-	for {
+	for page := 0; ; page++ {
 		resp, err := session.request(http.MethodGet, path, "")
 		if err != nil {
 			return nil, err
 		}
 		next := nextLink(resp.header.Get("Link"))
-		var page tagsPage
-		if err := json.Unmarshal(resp.body, &page); err != nil {
+		var payload tagsPage
+		if err := json.Unmarshal(resp.body, &payload); err != nil {
 			return nil, fmt.Errorf("decoding tag list response: %w", err)
 		}
-		tags = append(tags, page.Tags...)
+		tags = append(tags, payload.Tags...)
 
-		if len(tags) >= c.maxTags {
-			break
-		}
-		if next == "" {
+		// An empty page or a missing next link ends the list; the counters are
+		// belt and braces against a registry that never stops paging.
+		if next == "" || len(payload.Tags) == 0 || len(tags) >= c.maxTags || page+1 >= maxTagPages {
 			break
 		}
 		path = next
-		pages++
-		if pages >= 100 {
-			break
-		}
 	}
 
 	sort.Strings(tags)
@@ -259,9 +286,7 @@ func (c *Client) ociTags(image reference.Reference, pattern *regexp.Regexp) ([]T
 		}
 	}
 
-	// Probing the push time costs a few requests per tag, so skip it when the
-	// pattern is very broad and fall back to natural ordering.
-	if len(matches) > 100 {
+	if !needPushTimes || len(matches) > maxProbeTags {
 		out := make([]TagMatch, len(matches))
 		for i, tag := range matches {
 			out[i] = TagMatch{Tag: tag}
@@ -269,24 +294,54 @@ func (c *Client) ociTags(image reference.Reference, pattern *regexp.Regexp) ([]T
 		return out, nil
 	}
 
-	result := make([]TagMatch, 0, len(matches))
-	for _, tag := range matches {
-		created, err := session.tagCreated(tag)
-		if err != nil {
-			created = nil
-		}
-		result = append(result, TagMatch{Tag: tag, Pushed: created})
+	return c.probePushTimes(session, matches), nil
+}
+
+// probePushTimes reads the creation timestamp of each tag, a few tags at a
+// time.
+func (c *Client) probePushTimes(session *session, matches []string) []TagMatch {
+	workers := c.concurrency
+	if workers < 1 {
+		workers = 1
 	}
-	return result, nil
+	if workers > len(matches) {
+		workers = len(matches)
+	}
+
+	out := make([]TagMatch, len(matches))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				index := int(next.Add(1)) - 1
+				if index >= len(matches) {
+					return
+				}
+				created, err := session.tagCreated(matches[index])
+				if err != nil {
+					created = nil
+				}
+				out[index] = TagMatch{Tag: matches[index], Pushed: created}
+			}
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // session is a registry session for one host + repository, caching its auth
-// header.
+// header. Several goroutines may probe tags through the same session, so the
+// cached header is guarded by mu.
 type session struct {
 	client     *Client
 	host       string
 	repository string
-	auth       string
+
+	mu   sync.Mutex
+	auth string
 }
 
 func newSession(client *Client, host, repository string) *session {
@@ -330,7 +385,7 @@ func (s *session) request(method, path, accept string) (*response, error) {
 		if challenge == "" {
 			return nil, fmt.Errorf("%s requires authentication", s.host)
 		}
-		if err := s.authorize(challenge); err != nil {
+		if err := s.ensureAuthorized(challenge); err != nil {
 			return nil, err
 		}
 		resp, err = s.send(method, url, accept)
@@ -353,8 +408,8 @@ func (s *session) send(method, url, accept string) (*response, error) {
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
-	if s.auth != "" {
-		req.Header.Set("Authorization", s.auth)
+	if auth := s.authorization(); auth != "" {
+		req.Header.Set("Authorization", auth)
 	}
 
 	httpResp, err := s.client.http.Do(req)
@@ -367,6 +422,24 @@ func (s *session) send(method, url, accept string) (*response, error) {
 		return nil, err
 	}
 	return &response{status: httpResp.StatusCode, header: httpResp.Header, body: body}, nil
+}
+
+// authorization returns the cached auth header, if any.
+func (s *session) authorization() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auth
+}
+
+// ensureAuthorized performs the handshake once, even when several requests
+// race on the same session. A later 401 is answered from the cached header.
+func (s *session) ensureAuthorized(challenge string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.auth != "" {
+		return nil
+	}
+	return s.authorize(challenge)
 }
 
 // authorize performs the bearer/basic token handshake described by challenge.
